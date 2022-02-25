@@ -1,0 +1,169 @@
+Part 3: Benchmarking
+
+Local machine specs:
+    CPU: Intel i7-8700k @ 4x 3.7GHz
+    Memory: 5GB (16GB installed in the host)
+    Operating System: Debian 10 Buster (VirtualBox VM)
+
+Timing was done using the following command template
+    
+    $ time ./collatz-{ivec/list}-{hwx/sys/opt} N
+
+and looking at the resulting 'real' time value
+
+Comparing to the hwx allocator:
+
++-------+-------+-----------+-----------+---------+------------+
+| Test  |   N   |    HWX    |    OPT    | Speedup | Difference |
++-------+-------+-----------+-----------+---------+------------+
+| IVEC  | 14010 |   9.960s  |   0.085s  |  117.2  |    9.875   |
++-------+-------+-----------+-----------+---------+------------+
+| LIST  |  3300 |  10.016s  |   0.028s  |  357.8  |    9.988   |
++-------+-------+-----------+-----------+---------+------------+
+
+Speedup = HWX exec time / OPT exec time
+Difference = HWX exec time - OPT exec time
+
+As you can see the optimized allocator blew away the hwx 
+allocator in performance. This is evident with speedups
+in the x100+ range which shows just how inefficient the
+hwx allocator is. This makes sense since the hwx allocator
+is using a list structure whose time complexity for 
+operations will grow linearly with the input size at best.
+Clearly, one can see how much of a difference there is just by
+noticing that the difference in execution time of 9.875 and
+9.988 for the ivec and list programs respectively is almost the
+same as the execution time for those same programs using the hwx
+allocator (9.960 and 10.016 resp).
+
+
+Comparing to the system (sys) allocator:
+
++-------+---------+-----------+-----------+---------+------------+
+| Test  |    N    |    SYS    |    OPT    | Speedup | Difference |
++-------+---------+-----------+-----------+---------+------------+
+| IVEC  | 1840000 |  10.095s  |   7.712s  |   1.31  |    2.383   |
++-------+---------+-----------+-----------+---------+------------+
+| LIST  |  550000 |  10.472s  |   8.361s  |   1.25  |    2.111   |
++-------+---------+-----------+-----------+---------+------------+
+
+Speedup = SYS exec time / OPT exec time
+Difference = SYS exec time - OPT exec time
+
+Comparing the optimized allocator shows a very different
+story, and for good reason. The system allocator has been
+perfected (or at least been improved) over many years and
+probably implements some of the most sophisticated
+methods of memory mangement. It has to because it is 
+expected to be reasonably performant is pretty much any
+progam its used in. The optimized allocator is able to
+beat it out in both cases. For the vector based program the
+optimized allocator was able to improve execution times for
+both programs by approximately 2 seconds each (2.383 and 2.111
+for the vector and list programs respectively). This is fairly
+substantial considering that, for either program, the smallest
+execution time recorded with the system allocator was just 
+over 10 seconds.
+
+
+Techniques used in the optimized allocator:
+
+In the optimized allocator a few different optimization were
+employed to improve performance to where it is now. First of
+all this allocator uses a bucket system where it allocates
+large blocks of pages which are used to store as many entries
+with their corresponding used bit, as possible. Using this method
+naturally allows us to align the chunk on a specified boundary
+which makes finding the metadata for a block trivial. This allows
+for operations to occur in constant time since allocations are
+relatively trivial by using first unused index stored in the block.
+free's are just as trivial since they involve clearing the same
+used bit and checking if the block is now empty. This is helped
+by some other optimizations such as using a reference count to
+keep track of the number of allocation used with a block, and 
+storing a lock for the data in the block so multiple threads
+can access the same data if they have to. 
+
+This program also uses multiple arenas, these are assigned 
+at runtime to threads that make their first allocation. The last 
+arena is used as a shared arena amongst all extra threads to 
+allow for functionality with more threads, even if the 
+performance will be degraded. Using multiple arenas allows 
+different threads to keep track of blocks that are important to 
+them, and them only. This way the threads are not trying to 
+contest a shared memory resource as much. 
+
+Other than the large architecture optimization a lot of small
+significant optimizations are used to increase performance in
+these specifiec test cases. For example, the program is able
+to allocate a little more space for certain size entries assuming
+they are going to grow in the future. Or, when doing checks to
+determine what bucket the allocation needs to come from, putting
+the most common sizes first, makes the program run a lot faster.
+
+
+How does the allocator handle reuseing memory?:
+
+In my case the allocator handles reusing memory in three distinct 
+ways, all require that all of a blocks entries have been marked 
+free.
+
+1. If the block is already "owned" (in the arena of the inspecting
+thread) removing the block is as trivial as locking the arena and 
+removing the block from the list of blocks in the thread's arena 
+and umapping it.
+
+2. If the block is not "owned" by the thread but instead the block
+is not first in position in any buckets of other thread's, the 
+block can be safely discarded by locking the "owning" thread's 
+arena, removing it from the arenas block list and unmapping it.
+
+3. If it is the particular case where another thread is using the 
+block as the first entry in a list of blocks in a bucket, the 
+thread can mark the bucket as having a reusable front node. This 
+is to avoid resource contention, but as a result when an arena 
+needs to map in more memory for an allocation block, it will first
+check this reusable flag and look for any reusable blocks. That
+way this memory is reused for some allocation at some point.
+
+
+
+What was the most significant challenge in building 
+the allocator?:
+
+By far the hardest part of building an allocator is debugging.
+Sometimes problems do not arise consistently, lurking in the
+shadows for when you least expect it. While it is annoying this
+is not the real problem. The real problem is that when a problem
+does occur, it is often the case that the logic that caused it
+to happed is long gone which doesn't leave you a lot of room
+for finding it. This goes hand in hand with race conditions that
+don't pop up until a very specifiec set of criteria are met that
+might not appear all of the time. These can be especially hard
+to track down because they aren't consistent, and the debugger
+might have to execute the program several times to get the 
+specific problem to appear. And even then sometimes the problem
+isn't obvious.
+
+
+
+If I were to redo the assignment would I use the same allocator
+design? why?
+
+I think in the even I were to redo the assignment I would keep
+the basic structure of the allocator very similar. I think having
+aligned storage, or something like it, is a must. It allows you to
+effortlessly find the metadata for a collection of allocations 
+while simultaneously making frees and allocations using that
+block constant time. Which I think is a must for having a fast
+allocator. But I do think there are a lot of improvements that
+could be made. Namely, resource contention is still a problem
+and maybe a more complex structure would allow threads to work
+more independently. But in general, I think using a block/bucket
+allocation method allows for the efficient usage of storage since
+it allows for the more efficient storage of small entries. Memory
+allowing they also scale very well with input size since they 
+don't scale in complexity with how much memory is allocated
+because blocks are handled independently. So yes, I would keep
+the same allocator design.
+
